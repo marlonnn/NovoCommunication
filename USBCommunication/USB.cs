@@ -66,6 +66,10 @@ namespace NovoCommunication.USBCommunication
         private CyUSBDevice loopDevice;
         private USBDeviceList usbDevices;
         private CyBulkEndPoint inEndpoint;
+        public CyUSBEndPoint InEndpoint
+        {
+            get { return this.inEndpoint; }
+        }
         private CyBulkEndPoint outEndpoint;
         private string usbName;
         private readonly int _delayms; //延迟时间,单位毫秒
@@ -79,6 +83,8 @@ namespace NovoCommunication.USBCommunication
                 return instance;
             }
         }
+
+        log4net.ILog log = log4net.LogManager.GetLogger("MyLogger");
 
         private USB()
         {
@@ -113,12 +119,21 @@ namespace NovoCommunication.USBCommunication
 
             if (loopDevice != null)
             {
-                usbName = loopDevice.FriendlyName;
-                outEndpoint = loopDevice.EndPointOf(0x02) as CyBulkEndPoint;
-                inEndpoint = loopDevice.EndPointOf(0x86) as CyBulkEndPoint;
-                outEndpoint.TimeOut = 500;
-                inEndpoint.TimeOut = 1000;
-                _isUSBAvailable = true;
+                try
+                {
+                    usbName = loopDevice.FriendlyName;
+                    outEndpoint = loopDevice.EndPointOf(0x02) as CyBulkEndPoint;
+                    inEndpoint = loopDevice.EndPointOf(0x86) as CyBulkEndPoint;
+                    outEndpoint.TimeOut = 500;
+                    inEndpoint.TimeOut = 1000;
+                    _isUSBAvailable = true;
+                    InitializeParams();
+                    PreReadAsysnchonous();
+                }
+                catch (Exception ex)
+                {
+                    return false;
+                }
                 return true;
             }
             else
@@ -230,6 +245,73 @@ namespace NovoCommunication.USBCommunication
             return false;
         }
 
+        int BufSz;
+        int QueueSz;
+        int PPX;
+        int IsoPktBlockSize;
+        byte[] cBufs;
+        byte[] xBufs;
+        byte[] oLaps;
+        ISO_PKT_INFO[] pktsInfo;
+        private void InitializeParams()
+        {
+            BufSz = InEndpoint.MaxPktSize * Convert.ToUInt16(16);
+            QueueSz = Convert.ToUInt16(8);
+            PPX = Convert.ToUInt16(16);
+
+            InEndpoint.XferSize = BufSz;
+
+            if (InEndpoint is CyIsocEndPoint)
+                IsoPktBlockSize = (InEndpoint as CyIsocEndPoint).GetPktBlockSize(BufSz);
+            else
+                IsoPktBlockSize = 0;
+        }
+
+        public unsafe bool PreReadAsysnchonous()
+        {
+            cBufs = new byte[CyConst.SINGLE_XFER_LEN + IsoPktBlockSize + ((InEndpoint.XferMode == XMODE.BUFFERED) ? BufSz : 0)];
+            xBufs = new byte[BufSz];
+            oLaps = new byte[20];
+            pktsInfo = new ISO_PKT_INFO[PPX];
+            fixed (byte* tL0 = oLaps, tc0 = cBufs, tb0 = xBufs)
+            {
+                OVERLAPPED* ovLapStatus = (OVERLAPPED*)tL0;
+                ovLapStatus->hEvent = (IntPtr)PInvoke.CreateEvent(0, 0, 0, 0);
+                // Pre-load the queue with a request
+                int len = BufSz;
+                if (InEndpoint.BeginDataXfer(ref cBufs, ref xBufs, ref len, ref oLaps) == false)
+                {
+                    LogHelper.GetLogger<USB>().Debug("Begin data xfer failure");
+                }
+                if (!InEndpoint.WaitForXfer(ovLapStatus->hEvent, 500))
+                {
+                    InEndpoint.Abort();
+                    PInvoke.WaitForSingleObject(ovLapStatus->hEvent, 500);
+                }
+
+            }
+            return true;
+        }
+
+        public void ReadAsysnchonous()
+        {
+            if (InEndpoint.Attributes == 1)
+            {
+                CyIsocEndPoint isoc = InEndpoint as CyIsocEndPoint;
+                // FinishDataXfer
+                if (isoc.FinishDataXfer(ref cBufs, ref xBufs, ref BufSz, ref oLaps, ref pktsInfo))
+                {
+                    LogHelper.GetLogger<USB>().Debug("isoc finish data xfer: ");
+                }
+                else
+                {
+                    if (InEndpoint.FinishDataXfer(ref cBufs, ref xBufs, ref BufSz, ref oLaps))
+                    {
+                        LogHelper.GetLogger<USB>().Debug("finish data xfer: ");
+                    }
+                }
+            }
+        }
         public bool readDataSynchronous2(CBase cBaseCommand, out int nLen)
         {
             nLen = 0;
@@ -341,41 +423,42 @@ namespace NovoCommunication.USBCommunication
 
                 Thread.Sleep(_delayms);
                 int nTimes = 0;
-                while (readDataSynchronous2(cSendCommand, out nLen))
-                {
-                    // 在log里记录接收的命令
-                    if (IsCommandNeedRecordLog(cDecodeCommand))
-                    {
-                        RecordCommandLog(_receiveBuf, nLen, false);
-                    }
-                    bBuf = BitConverter.GetBytes(nLen);
-                    Array.Copy(bBuf, 0, _receiveBuf, _receiveBuf.Length - 5, 4);//write data length at end
+                ReadAsysnchonous();
+                //while (readDataSynchronous2(cSendCommand, out nLen))
+                //{
+                //    // 在log里记录接收的命令
+                //    if (IsCommandNeedRecordLog(cDecodeCommand))
+                //    {
+                //        RecordCommandLog(_receiveBuf, nLen, false);
+                //    }
+                //    bBuf = BitConverter.GetBytes(nLen);
+                //    Array.Copy(bBuf, 0, _receiveBuf, _receiveBuf.Length - 5, 4);//write data length at end
 
-                    cDecodeCommand.decode(_receiveBuf);
-                    if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandDecodeError)
-                    {
-                        nTimes++;
-                    }
-                    else if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandReceivedError)
-                    {
-                        return CommunicationState.CommReceivedError;
-                    }
-                    else if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandReject)
-                    {
-                        return CommunicationState.CommReject;
-                    }
-                    else
-                    {
-                        return CommunicationState.CommOK;
-                    }
+                //    cDecodeCommand.decode(_receiveBuf);
+                //    if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandDecodeError)
+                //    {
+                //        nTimes++;
+                //    }
+                //    else if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandReceivedError)
+                //    {
+                //        return CommunicationState.CommReceivedError;
+                //    }
+                //    else if (cDecodeCommand.ErrorCode == (ushort)ReturnCode.CommandReject)
+                //    {
+                //        return CommunicationState.CommReject;
+                //    }
+                //    else
+                //    {
+                //        return CommunicationState.CommOK;
+                //    }
 
-                    if (nTimes >= 9)
-                    {
-                        ProcessError(cDecodeCommand, "This command decode error,and it have re-try 9 times read,and it also error !");
-                        return CommunicationState.CommDecodeError;
-                    }
-                    Thread.Sleep(_delayms);
-                }
+                //    if (nTimes >= 9)
+                //    {
+                //        ProcessError(cDecodeCommand, "This command decode error,and it have re-try 9 times read,and it also error !");
+                //        return CommunicationState.CommDecodeError;
+                //    }
+                //    Thread.Sleep(_delayms);
+                //}
             }
             return CommunicationState.CommTimeOut;
         }
@@ -396,11 +479,13 @@ namespace NovoCommunication.USBCommunication
                 }
                 if (isSend)
                 {
-                    ProcessError(null, string.Format("----------Send Command {0}", log));
+                    //ProcessError(null, string.Format("----------Send Command {0}", log));
+                    LogHelper.GetLogger<Form1>().Debug(string.Format("----------Send Command {0}", log));
                 }
                 else
                 {
-                    ProcessError(null, string.Format("++++++++++Receive Command {0}", log));
+                    //ProcessError(null, string.Format("++++++++++Receive Command {0}", log));
+                    LogHelper.GetLogger<Form1>().Debug(string.Format("++++++++++Receive Command {0}", log));
                 }
             }
         }
